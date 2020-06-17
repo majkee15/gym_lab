@@ -7,6 +7,8 @@ import datetime
 from gym.spaces import Box, Discrete
 
 from policies.memory import Transition, ReplayMemory
+from policies.prioritized_memory import Experience
+
 from policies.base import Policy, BaseModelMixin, TrainConfig
 from utils.misc import plot_learning_curve
 
@@ -33,6 +35,9 @@ class DefaultConfig(TrainConfig):
     batch_normalization = False
     batch_size = 256
 
+    prioritized_memory_replay = True
+    replay_alpha = 1.6
+
 
 class DQNAgent(Policy, BaseModelMixin):
 
@@ -44,7 +49,13 @@ class DQNAgent(Policy, BaseModelMixin):
         self.env = env
         self.config = config
         self.batch_size = self.config.batch_size
-        self.memory = ReplayMemory(capacity=self.config.memory_size)
+
+        if config.prioritized_memory_replay:
+            self.memory = Experience(memory_size=self.config.memory_size, batch_size=self.config.batch_size,
+                                     alpha=self.config.replay_alpha)
+        else:
+            self.memory = ReplayMemory(capacity=self.config.memory_size)
+
         self.layers = layers
 
         # Optimizer
@@ -89,7 +100,11 @@ class DQNAgent(Policy, BaseModelMixin):
         self.target_net.set_weights(self.main_net.get_weights())
 
     def train(self):
-        batch = self.memory.sample(self.batch_size)
+        if self.config.prioritized_memory_replay:
+            pass
+        else:
+            batch = self.memory.sample(self.batch_size)
+
         states = batch['s']
         actions = batch['a']
         rewards = batch['r']
@@ -147,7 +162,10 @@ class DQNAgent(Policy, BaseModelMixin):
             while not done:
                 action, q_value = self.get_action(state, epsilon)
                 next_state, reward, done, info = self.env.step(action)
-                self.memory.add(Transition(state, action, reward, next_state, done))
+                if self.config.prioritized_memory_replay:
+                    self.memory.add(Transition(state, action, reward, next_state, done), priority=0.5)
+                else:
+                    self.memory.add(Transition(state, action, reward, next_state, done))
                 score += reward
 
                 state = next_state
