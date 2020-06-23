@@ -6,11 +6,12 @@ import datetime
 
 from gym.spaces import Box, Discrete
 
-from policies.memory import Transition, ReplayMemory
-from policies.prioritized_memory import PrioritizedReplayBuffer
+from policies.memory import Transition, ReplayMemory, PrioritizedReplayMemory
+# from policies.prioritized_memory import PrioritizedReplayBuffer
 
 from policies.base import Policy, BaseModelMixin, TrainConfig
 from utils.misc import plot_learning_curve
+from utils.annealing_schedule import AnnealingSchedule
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
@@ -29,17 +30,20 @@ class DefaultConfig(TrainConfig):
     gamma = 1.0
     epsilon = 1.0
     epsilon_final = 0.01
-    memory_size = 100000
+    epsilon_schedule = AnnealingSchedule(epsilon, epsilon_final, warmup_episodes)
     target_update_every_step = 25
     log_every_episode = 10
 
+    # Memory setting
     batch_normalization = False
     batch_size = 256
-
+    memory_size = 100000
     # PER setting
     prioritized_memory_replay = True
     replay_alpha = 0.2
-    replay_beta = 0.6
+    replay_beta = 0.4
+    replay_beta_final = 1.0
+    beta_schedule = AnnealingSchedule(replay_beta, replay_beta_final, warmup_episodes)
     prior_eps = 1e-6
 
 
@@ -55,8 +59,7 @@ class DQNAgent(Policy, BaseModelMixin):
         self.batch_size = self.config.batch_size
 
         if config.prioritized_memory_replay:
-            self.memory = PrioritizedReplayBuffer(obs_dim=env.observation_space.shape[0], size=self.config.memory_size,
-                                                  batch_size=self.config.batch_size, alpha=self.config.replay_alpha)
+            self.memory = PrioritizedReplayMemory(alpha=config.replay_alpha, capacity=config.memory_size)
         else:
             self.memory = ReplayMemory(capacity=self.config.memory_size)
 
@@ -88,9 +91,6 @@ class DQNAgent(Policy, BaseModelMixin):
 
         self.main_net.compile(optimizer='adam', loss=tf.keras.losses.MeanSquaredError())
 
-    # def append_sample(self, state, action, reward, next_state, done):
-    #     self.memory.append((state, action, reward, next_state, done))
-
     def get_action(self, state, epsilon):
         q_value = self.main_net.predict_on_batch(state[None, :])
         if np.random.rand() <= epsilon:
@@ -104,22 +104,16 @@ class DQNAgent(Policy, BaseModelMixin):
         self.target_net.set_weights(self.main_net.get_weights())
 
     def train(self):
+        batch = self.memory.sample(self.batch_size, beta=self.config.beta_schedule.current_p)
+        states = batch['s']
+        actions = batch['a']
+        rewards = batch['r']
+        next_states = batch['s_next']
+        dones = batch['done']
+
         if self.config.prioritized_memory_replay:
-            batch = self.memory.sample_batch(beta=self.config.replay_beta)
-            states = batch['obs']
-            actions = batch['acts']
-            rewards = batch['rews']
-            next_states = batch['next_obs']
-            dones = batch['done']
             idx = batch['indices']
             weights = batch['weights']
-        else:
-            batch = self.memory.sample(self.batch_size)
-            states = batch['s']
-            actions = batch['a']
-            rewards = batch['r']
-            next_states = batch['s_next']
-            dones = batch['done']
 
         dqn_variable = self.main_net.trainable_variables
         with tf.GradientTape() as tape:
@@ -159,11 +153,7 @@ class DQNAgent(Policy, BaseModelMixin):
     def run(self):
 
         n_episodes = self.config.n_episodes
-        warmup_episodes = self.config.warmup_episodes
-        epsilon = self.config.epsilon
-        epsilon_final = self.config.epsilon_final
         loss = None
-        eps_drop = (epsilon - epsilon_final) / warmup_episodes
 
         total_rewards = np.empty(n_episodes)
 
@@ -176,12 +166,9 @@ class DQNAgent(Policy, BaseModelMixin):
 
             score = 0
             while not done:
-                action, q_value = self.get_action(state, epsilon)
+                action, q_value = self.get_action(state, self.config.epsilon_schedule.current_p)
                 next_state, reward, done, info = self.env.step(action)
-                if self.config.prioritized_memory_replay:
-                    self.memory.store(state, action, reward, next_state, done)
-                else:
-                    self.memory.add(Transition(state, action, reward, next_state, done))
+                self.memory.add(Transition(state, action, reward, next_state, done))
                 score += reward
 
                 state = next_state
@@ -191,11 +178,11 @@ class DQNAgent(Policy, BaseModelMixin):
                     if i % self.config.target_update_every_step == 0:
                         self.update_target()
 
-            if epsilon > epsilon_final:
-                epsilon = max(epsilon_final, epsilon - eps_drop)
-
             total_rewards[i] = score
             avg_rewards = total_rewards[max(0, i - 100):(i + 1)].mean()
+
+            self.config.epsilon_schedule.anneal()
+            self.config.beta_schedule.anneal()
 
             with self.writer.as_default():
                 with tf.name_scope('Performance'):
@@ -216,7 +203,7 @@ class DQNAgent(Policy, BaseModelMixin):
 
             if i % self.config.log_every_episode == 0:
                 print("episode:", i, "/", self.config.n_episodes, "episode reward:", score,"avg reward (last 100):",
-                      avg_rewards, "eps:", epsilon, "Learning rate (10e3):",
+                      avg_rewards, "eps:",  self.config.epsilon_schedule.current_p, "Learning rate (10e3):",
                       (self.optimizer._decayed_lr(tf.float32).numpy() * 1000),
                       "Consecutively solved:", solved_consecutively)
 
