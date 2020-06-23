@@ -64,13 +64,13 @@ class Policy:
         return ob.flatten()
 
     def act(self, state, **kwargs):
-        pass
+        raise NotImplementedError
 
     def build(self):
         pass
 
     def train(self, *args, **kwargs):
-        pass
+        raise NotImplementedError
 
     def evaluate(self, n_episodes):
         reward_history = []

@@ -1,174 +1,159 @@
-import numpy
 import random
-
-class Experience(object):
-    """ The class represents prioritized experience replay buffer.
-    The class has functions: store samples, pick samples with
-    probability in proportion to sample's priority, update
-    each sample's priority, reset alpha.
-    see https://arxiv.org/pdf/1511.05952.pdf .
-    """
-
-    def __init__(self, memory_size, batch_size, alpha):
-        """ Prioritized experience replay buffer initialization.
-
-        Parameters
-        ----------
-        memory_size : int
-            sample size to be stored
-        batch_size : int
-            batch size to be selected by `select` method
-        alpha: float
-            exponent determine how much prioritization.
-            Prob_i \sim priority_i**alpha/sum(priority**alpha)
-        """
-        self.tree = SumTree(memory_size)
-        self.memory_size = memory_size
-        self.batch_size = batch_size
-        self.alpha = alpha
-
-    def add(self, data, priority):
-        """ Add new sample.
-
-        Parameters
-        ----------
-        data : object
-            new sample
-        priority : float
-            sample's priority
-        """
-        self.tree.add(data, priority ** self.alpha)
-
-    def select(self, beta):
-        """ The method return samples randomly.
-
-        Parameters
-        ----------
-        beta : float
-
-        Returns
-        -------
-        out :
-            list of samples
-        weights:
-            list of weight
-        indices:
-            list of sample indices
-            The indices indicate sample positions in a sum tree.
-        """
-
-        if self.tree.filled_size() < self.batch_size:
-            return None, None, None
-
-        out = []
-        indices = []
-        weights = []
-        priorities = []
-        for _ in range(self.batch_size):
-            r = random.random()
-            data, priority, index = self.tree.find(r)
-            priorities.append(priority)
-            weights.append((1. / self.memory_size / priority) ** beta if priority > 1e-16 else 0)
-            indices.append(index)
-            out.append(data)
-            self.priority_update([index], [0])  # To avoid duplicating
-
-        self.priority_update(indices, priorities)  # Revert priorities
-
-        weights /= max(weights)  # Normalize for stability
-
-        return out, weights, indices
-
-    def priority_update(self, indices, priorities):
-        """ The methods update samples's priority.
-
-        Parameters
-        ----------
-        indices :
-            list of sample indices
-        """
-        for i, p in zip(indices, priorities):
-            self.tree.val_update(i, p ** self.alpha)
-
-    def reset_alpha(self, alpha):
-        """ Reset a exponent alpha.
-        Parameters
-        ----------
-        alpha : float
-        """
-        self.alpha, old_alpha = alpha, self.alpha
-        priorities = [self.tree.get_val(i) ** -old_alpha for i in range(self.tree.filled_size())]
-        self.priority_update(range(self.tree.filled_size()), priorities)
+from typing import Dict, List, Tuple
+import numpy as np
+from utils.segment_tree import MinSegmentTree, SumSegmentTree
 
 
-import sys
-import os
-import math
+class ReplayBuffer:
+    """A simple numpy replay buffer."""
 
+    def __init__(self, obs_dim: int, size: int, batch_size: int = 32):
+        self.obs_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.next_obs_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.acts_buf = np.zeros([size], dtype=np.int32)
+        self.rews_buf = np.zeros([size], dtype=np.float32)
+        self.done_buf = np.zeros(size, dtype=np.float32)
+        self.max_size, self.batch_size = size, batch_size
+        self.ptr, self.size, = 0, 0
 
-class SumTree(object):
-    def __init__(self, max_size):
-        self.max_size = max_size
-        self.tree_level = math.ceil(math.log(max_size + 1, 2)) + 1
-        self.tree_size = 2 ** self.tree_level - 1
-        self.tree = [0 for i in range(self.tree_size)]
-        self.data = [None for i in range(self.max_size)]
-        self.size = 0
-        self.cursor = 0
-
-    def add(self, contents, value):
-        index = self.cursor
-        self.cursor = (self.cursor + 1) % self.max_size
+    def store(
+        self,
+        obs: np.ndarray,
+        act: np.ndarray,
+        rew: float,
+        next_obs: np.ndarray,
+        done: bool,
+    ):
+        self.obs_buf[self.ptr] = obs
+        self.next_obs_buf[self.ptr] = next_obs
+        self.acts_buf[self.ptr] = act
+        self.rews_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+        self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
-        self.data[index] = contents
-        self.val_update(index, value)
+    def sample_batch(self) -> Dict[str, np.ndarray]:
+        idxs = np.random.choice(self.size, size=self.batch_size, replace=False)
+        return dict(obs=self.obs_buf[idxs],
+                    next_obs=self.next_obs_buf[idxs],
+                    acts=self.acts_buf[idxs],
+                    rews=self.rews_buf[idxs],
+                    done=self.done_buf[idxs])
 
-    def get_val(self, index):
-        tree_index = 2 ** (self.tree_level - 1) - 1 + index
-        return self.tree[tree_index]
-
-    def val_update(self, index, value):
-        tree_index = 2 ** (self.tree_level - 1) - 1 + index
-        diff = value - self.tree[tree_index]
-        self.reconstruct(tree_index, diff)
-
-    def reconstruct(self, tindex, diff):
-        self.tree[tindex] += diff
-        if not tindex == 0:
-            tindex = int((tindex - 1) / 2)
-            self.reconstruct(tindex, diff)
-
-    def find(self, value, norm=True):
-        if norm:
-            value *= self.tree[0]
-        return self._find(value, 0)
-
-    def _find(self, value, index):
-        if 2 ** (self.tree_level - 1) - 1 <= index:
-            return self.data[index - (2 ** (self.tree_level - 1) - 1)], self.tree[index], index - (
-                        2 ** (self.tree_level - 1) - 1)
-
-        left = self.tree[2 * index + 1]
-
-        if value <= left:
-            return self._find(value, 2 * index + 1)
-        else:
-            return self._find(value - left, 2 * (index + 1))
-
-    def print_tree(self):
-        for k in range(1, self.tree_level + 1):
-            for j in range(2 ** (k - 1) - 1, 2 ** k - 1):
-                print(self.tree[j], end=' ')
-            print()
-
-    def filled_size(self):
+    def __len__(self) -> int:
         return self.size
 
 
-if __name__ == '__main__':
-    s = SumTree(10)
-    for i in range(20):
-        s.add(2 ** i, i)
-    s.print_tree()
-    print(s.find(0.5))
+class PrioritizedReplayBuffer(ReplayBuffer):
+    """Prioritized Replay buffer.
+
+    Attributes:
+        max_priority (float): max priority
+        tree_ptr (int): next index of tree
+        alpha (float): alpha parameter for prioritized replay buffer
+        sum_tree (SumSegmentTree): sum tree for prior
+        min_tree (MinSegmentTree): min tree for min prior to get max weight
+
+    """
+
+    def __init__(
+            self,
+            obs_dim: int,
+            size: int,
+            batch_size: int,
+            alpha: float = 0.6
+    ):
+        """Initialization."""
+        assert alpha >= 0
+
+        super(PrioritizedReplayBuffer, self).__init__(obs_dim, size, batch_size)
+        self.max_priority, self.tree_ptr = 1.0, 0
+        self.alpha = alpha
+
+        # capacity must be positive and a power of 2.
+        tree_capacity = 1
+        while tree_capacity < self.max_size:
+            tree_capacity *= 2
+
+        self.sum_tree = SumSegmentTree(tree_capacity)
+        self.min_tree = MinSegmentTree(tree_capacity)
+
+    def store(
+            self,
+            obs: np.ndarray,
+            act: int,
+            rew: float,
+            next_obs: np.ndarray,
+            done: bool
+    ):
+        """Store experience and priority."""
+        super().store(obs, act, rew, next_obs, done)
+
+        self.sum_tree[self.tree_ptr] = self.max_priority ** self.alpha
+        self.min_tree[self.tree_ptr] = self.max_priority ** self.alpha
+        self.tree_ptr = (self.tree_ptr + 1) % self.max_size
+
+    def sample_batch(self, beta: float = 0.4) -> Dict[str, np.ndarray]:
+        """Sample a batch of experiences."""
+        assert len(self) >= self.batch_size
+        assert beta > 0
+
+        indices = self._sample_proportional()
+
+        obs = self.obs_buf[indices]
+        next_obs = self.next_obs_buf[indices]
+        acts = self.acts_buf[indices]
+        rews = self.rews_buf[indices]
+        done = self.done_buf[indices]
+        weights = np.array([self._calculate_weight(i, beta) for i in indices])
+
+        return dict(
+            obs=obs,
+            next_obs=next_obs,
+            acts=acts,
+            rews=rews,
+            done=done,
+            weights=weights,
+            indices=indices,
+        )
+
+    def update_priorities(self, indices: List[int], priorities: np.ndarray):
+        """Update priorities of sampled transitions."""
+        assert len(indices) == len(priorities)
+
+        for idx, priority in zip(indices, priorities):
+            assert priority > 0
+            assert 0 <= idx < len(self)
+
+            self.sum_tree[idx] = priority ** self.alpha
+            self.min_tree[idx] = priority ** self.alpha
+
+            self.max_priority = max(self.max_priority, priority)
+
+    def _sample_proportional(self) -> List[int]:
+        """Sample indices based on proportions."""
+        indices = []
+        p_total = self.sum_tree.sum(0, len(self) - 1)
+        segment = p_total / self.batch_size
+
+        for i in range(self.batch_size):
+            a = segment * i
+            b = segment * (i + 1)
+            upperbound = random.uniform(a, b)
+            idx = self.sum_tree.retrieve(upperbound)
+            indices.append(idx)
+
+        return indices
+
+    def _calculate_weight(self, idx: int, beta: float):
+        """Calculate the weight of the experience at idx."""
+        # get max weight
+        p_min = self.min_tree.min() / self.sum_tree.sum()
+        max_weight = (p_min * len(self)) ** (-beta)
+
+        # calculate weights
+        p_sample = self.sum_tree[idx] / self.sum_tree.sum()
+        weight = (p_sample * len(self)) ** (-beta)
+        weight = weight / max_weight
+
+        return weight

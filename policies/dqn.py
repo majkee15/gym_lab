@@ -7,12 +7,13 @@ import datetime
 from gym.spaces import Box, Discrete
 
 from policies.memory import Transition, ReplayMemory
-from policies.prioritized_memory import Experience
+from policies.prioritized_memory import PrioritizedReplayBuffer
 
 from policies.base import Policy, BaseModelMixin, TrainConfig
 from utils.misc import plot_learning_curve
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 
 class DefaultConfig(TrainConfig):
     n_episodes = 600
@@ -23,8 +24,8 @@ class DefaultConfig(TrainConfig):
     end_learning_rate = 0.0001
     # decaying learning rate
     learning_rate = tf.keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=learning_rate,
-                                                                  decay_steps=n_episodes,
-                                                                  end_learning_rate=learning_rate, power=1.0)
+                                                                  decay_steps=n_episodes*10000,
+                                                                  end_learning_rate=end_learning_rate, power=1.0)
     gamma = 1.0
     epsilon = 1.0
     epsilon_final = 0.01
@@ -35,8 +36,11 @@ class DefaultConfig(TrainConfig):
     batch_normalization = False
     batch_size = 256
 
+    # PER setting
     prioritized_memory_replay = True
-    replay_alpha = 1.6
+    replay_alpha = 0.2
+    replay_beta = 0.6
+    prior_eps = 1e-6
 
 
 class DQNAgent(Policy, BaseModelMixin):
@@ -51,8 +55,8 @@ class DQNAgent(Policy, BaseModelMixin):
         self.batch_size = self.config.batch_size
 
         if config.prioritized_memory_replay:
-            self.memory = Experience(memory_size=self.config.memory_size, batch_size=self.config.batch_size,
-                                     alpha=self.config.replay_alpha)
+            self.memory = PrioritizedReplayBuffer(obs_dim=env.observation_space.shape[0], size=self.config.memory_size,
+                                                  batch_size=self.config.batch_size, alpha=self.config.replay_alpha)
         else:
             self.memory = ReplayMemory(capacity=self.config.memory_size)
 
@@ -101,15 +105,21 @@ class DQNAgent(Policy, BaseModelMixin):
 
     def train(self):
         if self.config.prioritized_memory_replay:
-            pass
+            batch = self.memory.sample_batch(beta=self.config.replay_beta)
+            states = batch['obs']
+            actions = batch['acts']
+            rewards = batch['rews']
+            next_states = batch['next_obs']
+            dones = batch['done']
+            idx = batch['indices']
+            weights = batch['weights']
         else:
             batch = self.memory.sample(self.batch_size)
-
-        states = batch['s']
-        actions = batch['a']
-        rewards = batch['r']
-        next_states = batch['s_next']
-        dones = batch['done']
+            states = batch['s']
+            actions = batch['a']
+            rewards = batch['r']
+            next_states = batch['s_next']
+            dones = batch['done']
 
         dqn_variable = self.main_net.trainable_variables
         with tf.GradientTape() as tape:
@@ -123,7 +133,7 @@ class DQNAgent(Policy, BaseModelMixin):
             target_q = self.target_net.predict_on_batch(next_states)
 
 
-            # the next saction should be selected using the online net
+            # the next action should be selected using the online net
 
             target_value = tf.reduce_sum(tf.one_hot(next_action, self.act_size) * target_q, axis=1)
             target_value = (1 - dones) * self.config.gamma * target_value + rewards
@@ -132,9 +142,15 @@ class DQNAgent(Policy, BaseModelMixin):
             main_value = tf.reduce_sum(tf.one_hot(actions, self.act_size) * main_q, axis=1)
 
             td_error = target_value - main_value
-            error = tf.square(td_error) * 0.5
+            if self.config.prioritized_memory_replay:
+                error = tf.square(weights * td_error) * 0.5
+            else:
+                error = tf.square(td_error) * 0.5
             error = tf.reduce_mean(error)
 
+        # update per priorities
+        if self.config.prioritized_memory_replay:
+            self.memory.update_priorities(idx, np.abs(td_error.numpy()) + self.config.prior_eps)
         # loss = self.main_net.train_on_batch(states, target_value)
         dqn_grads = tape.gradient(error, dqn_variable)
         self.optimizer.apply_gradients(zip(dqn_grads, dqn_variable))
@@ -163,7 +179,7 @@ class DQNAgent(Policy, BaseModelMixin):
                 action, q_value = self.get_action(state, epsilon)
                 next_state, reward, done, info = self.env.step(action)
                 if self.config.prioritized_memory_replay:
-                    self.memory.add(Transition(state, action, reward, next_state, done), priority=0.5)
+                    self.memory.store(state, action, reward, next_state, done)
                 else:
                     self.memory.add(Transition(state, action, reward, next_state, done))
                 score += reward
