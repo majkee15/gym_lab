@@ -17,16 +17,17 @@ from utils.annealing_schedule import AnnealingSchedule
 
 
 class DefaultConfig(TrainConfig):
-    n_episodes = 600
-    warmup_episodes = 400
+    n_episodes = 250
+    warmup_episodes = 150
 
     # fixed learning rate
     learning_rate = 0.001
-    end_learning_rate = 0.0001
+    end_learning_rate = 0.001
     # decaying learning rate
-    learning_rate = tf.keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=learning_rate,
-                                                                  decay_steps=n_episodes*10000,
-                                                                  end_learning_rate=end_learning_rate, power=1.0)
+    # learning_rate = tf.keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=learning_rate,
+    #                                                               decay_steps=n_episodes*10000,
+    #                                                               end_learning_rate=end_learning_rate, power=1.0)
+    learning_rate_schedule = AnnealingSchedule(learning_rate, end_learning_rate, n_episodes)
     gamma = 1.0
     epsilon = 1.0
     epsilon_final = 0.01
@@ -36,14 +37,14 @@ class DefaultConfig(TrainConfig):
 
     # Memory setting
     batch_normalization = False
-    batch_size = 256
+    batch_size = 128
     memory_size = 100000
     # PER setting
     prioritized_memory_replay = True
-    replay_alpha = 0.2
+    replay_alpha = 0.3
     replay_beta = 0.4
     replay_beta_final = 1.0
-    beta_schedule = AnnealingSchedule(replay_beta, replay_beta_final, warmup_episodes)
+    beta_schedule = AnnealingSchedule(replay_beta, replay_beta_final, n_episodes, inverse=True)
     prior_eps = 1e-6
 
 
@@ -66,7 +67,12 @@ class DQNAgent(Policy, BaseModelMixin):
         self.layers = layers
 
         # Optimizer
-        self.optimizer = tf.keras.optimizers.RMSprop(learning_rate=self.config.learning_rate)#, clipnorm=5)
+        self.global_lr = tf.Variable(self.config.learning_rate_schedule.current_p, trainable=False)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.global_lr) #, clipnorm=100)
+        # Huber Loss
+        self.h = tf.keras.losses.Huber(delta=10.0, reduction=tf.keras.losses.Reduction.NONE)
+
+
         # Target net
         self.target_net = tf.keras.Sequential()
         self.target_net.add(tf.keras.layers.Input(shape=env.observation_space.shape))
@@ -88,8 +94,10 @@ class DQNAgent(Policy, BaseModelMixin):
                 self.main_net.add(tf.keras.layers.BatchNormalization())
         self.main_net.add(tf.keras.layers.Dense(env.action_space.n, activation='linear'))
         self.main_net.build()
-
         self.main_net.compile(optimizer='adam', loss=tf.keras.losses.MeanSquaredError())
+
+        # Global step - epoch - number of trainings elapsed
+        self.global_step = 0
 
     def get_action(self, state, epsilon):
         q_value = self.main_net.predict_on_batch(state[None, :])
@@ -136,19 +144,33 @@ class DQNAgent(Policy, BaseModelMixin):
             main_value = tf.reduce_sum(tf.one_hot(actions, self.act_size) * main_q, axis=1)
 
             td_error = target_value - main_value
+            element_wise_loss = tf.square(td_error) * 0.5
+            # element_wise_loss = self.h(target_value, main_value)
             if self.config.prioritized_memory_replay:
-                error = tf.square(weights * td_error) * 0.5
+                error = tf.reduce_mean(element_wise_loss * weights)
             else:
-                error = tf.square(td_error) * 0.5
-            error = tf.reduce_mean(error)
+                error = tf.reduce_mean(element_wise_loss)
+
 
         # update per priorities
         if self.config.prioritized_memory_replay:
             self.memory.update_priorities(idx, np.abs(td_error.numpy()) + self.config.prior_eps)
-        # loss = self.main_net.train_on_batch(states, target_value)
         dqn_grads = tape.gradient(error, dqn_variable)
         self.optimizer.apply_gradients(zip(dqn_grads, dqn_variable))
-        return error
+
+        # Logging
+        self.global_step += 1
+        with self.writer.as_default():
+            with tf.name_scope('Network'):
+                tf.summary.histogram('Weights', self.main_net.weights[0], step=self.global_step)
+                tf.summary.histogram('Gradients', dqn_grads[0], step=self.global_step)
+                tf.summary.histogram('Predictions', main_value, step=self.global_step)
+                tf.summary.histogram('Target', target_value, step=self.global_step)
+                tf.summary.histogram('TD error', td_error, step=self.global_step)
+                tf.summary.histogram('Elementwise Loss', element_wise_loss, step=self.global_step)
+                tf.summary.scalar('Loss', tf.reduce_mean(element_wise_loss), step=self.global_step)
+
+        return tf.reduce_mean(element_wise_loss)
 
     def run(self):
 
@@ -183,13 +205,19 @@ class DQNAgent(Policy, BaseModelMixin):
 
             self.config.epsilon_schedule.anneal()
             self.config.beta_schedule.anneal()
+            self.global_lr.assign(self.config.learning_rate_schedule.anneal())
 
             with self.writer.as_default():
                 with tf.name_scope('Performance'):
                     tf.summary.scalar('episode reward', score, step=i)
                     tf.summary.scalar('running avg reward(100)', avg_rewards, step=i)
-                    tf.summary.scalar('loss', 0 if loss is None else loss, step=i)
-                    tf.summary.histogram('Weights', self.main_net.weights[0], step=i)
+
+                if self.config.prioritized_memory_replay:
+                    with tf.name_scope('Schedules'):
+                        tf.summary.scalar('Beta', self.config.beta_schedule.current_p, step=i)
+                        tf.summary.scalar('Epsilon', self.config.epsilon_schedule.current_p, step=i)
+                        tf.summary.scalar('Learning rate', self.optimizer._decayed_lr(tf.float32).numpy(), step=i)
+
 
             # Specific four mountain car
             if done and score == 500:
@@ -202,8 +230,8 @@ class DQNAgent(Policy, BaseModelMixin):
                 break
 
             if i % self.config.log_every_episode == 0:
-                print("episode:", i, "/", self.config.n_episodes, "episode reward:", score,"avg reward (last 100):",
-                      avg_rewards, "eps:",  self.config.epsilon_schedule.current_p, "Learning rate (10e3):",
+                print("episode:", i, "/", self.config.n_episodes, "episode reward:", score, "avg reward (last 100):",
+                      avg_rewards, "eps:",  self.config.epsilon_schedule.current_p, "Learning rate (10e-3):",
                       (self.optimizer._decayed_lr(tf.float32).numpy() * 1000),
                       "Consecutively solved:", solved_consecutively)
 
@@ -221,8 +249,6 @@ class DQNAgent(Policy, BaseModelMixin):
             tf.summary.scalar('stddev', stddev)
             tf.summary.histogram('histogram', var)
 
-
-
     def save(self):
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = os.path.join(self.model_dir, current_time + '.h5')
@@ -231,6 +257,7 @@ class DQNAgent(Policy, BaseModelMixin):
     def load(self, modelh5):
         assert NotImplementedError
         self.main_net = tf.keras.models.load_model(modelh5)
+
 
 if __name__ == '__main__':
     import gym
